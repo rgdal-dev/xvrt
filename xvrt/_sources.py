@@ -33,6 +33,10 @@ class Source:
     size
         For ``composition="concat"``: number of elements this source
         contributes along the concat dim. ``None`` for stack (always 1).
+    original
+        The source string as the user originally passed it, before VSI or
+        relative-to-VRT rewriting. Used by size auto-discovery so the
+        fallback opener sees a resolvable path.
     """
 
     path: str
@@ -40,6 +44,7 @@ class Source:
     relative_to_vrt: bool = False
     size: int | None = None
     extra: Mapping[str, Any] = field(default_factory=dict)
+    original: str = ""
 
 
 _VSI_PREFIXES = ("/vsi",)
@@ -155,4 +160,5 @@ def _coerce_one(
         relative_to_vrt=rel,
         size=size,
         extra=extra,
+        original=path_str,
     )

@@ -34,19 +34,38 @@ write_mdim_vrt(
     crs = 'GEOGCRS[\"WGS 84\",\n    ENSEMBLE[\"World Geodetic System 1984 ensemble\",\n        MEMBER[\"World Geodetic System 1984 (Transit)\"],\n        MEMBER[\"World Geodetic System 1984 (G730)\"],\n        MEMBER[\"World Geodetic System 1984 (G873)\"],\n        MEMBER[\"World Geodetic System 1984 (G1150)\"],\n        MEMBER[\"World Geodetic System 1984 (G1674)\"],\n        MEMBER[\"World Geodetic System 1984 (G1762)\"],\n        MEMBER[\"World Geodetic System 1984 (G2139)\"],\n        MEMBER[\"World Geodetic System 1984 (G2296)\"],\n        ELLIPSOID[\"WGS 84\",6378137,298.257223563,\n            LENGTHUNIT[\"metre\",1]],\n        ENSEMBLEACCURACY[2.0]],\n    PRIMEM[\"Greenwich\",0,\n        ANGLEUNIT[\"degree\",0.0174532925199433]],\n    CS[ellipsoidal,2],\n        AXIS[\"geodetic latitude (Lat)\",north,\n            ORDER[1],\n            ANGLEUNIT[\"degree\",0.0174532925199433]],\n        AXIS[\"geodetic longitude (Lon)\",east,\n            ORDER[2],\n            ANGLEUNIT[\"degree\",0.0174532925199433]],\n    USAGE[\n        SCOPE[\"Horizontal component of 3D system.\"],\n        AREA[\"World.\"],\n        BBOX[-90,-180,90,180]],\n    ID[\"EPSG\",4326]]'
 )
 
-Traceback (most recent call last):
-  File "<string>", line 1, in <module>
-  File "/perm_storage/home/mdsumner/Git/xvrt/xvrt/_writer.py", line 114, in write_mdim_vrt
-    _check_concat(ds, data_var, sources_norm, concat_dim)
-    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/perm_storage/home/mdsumner/Git/xvrt/xvrt/_writer.py", line 276, in _check_concat
-    raise VrtWriterError(
-    ...<2 lines>...
-    )
-xvrt._errors.VrtWriterError: composition='concat': sources [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] missing 'size'. Pass sources as list[dict] with {'path': ..., 'size': N} for each.
 
 
 ```
+
+```
+ds
+<xarray.Dataset> Size: 335GB
+Dimensions:         (Time: 304, nv: 2, st_ocean: 51, yt_ocean: 1500,
+                     xt_ocean: 3600, st_edges_ocean: 52)
+Coordinates:
+  * Time            (Time) datetime64[ns] 2kB 2010-01-01T12:00:00 ... 2010-10...
+  * nv              (nv) float64 16B 1.0 2.0
+  * st_ocean        (st_ocean) float64 408B 2.5 7.5 12.5 ... 3.603e+03 4.509e+03
+  * yt_ocean        (yt_ocean) float64 12kB -74.95 -74.85 -74.75 ... 74.85 74.95
+  * xt_ocean        (xt_ocean) float64 29kB 0.05 0.15 0.25 ... 359.8 359.9 360.0
+  * st_edges_ocean  (st_edges_ocean) float64 416B 0.0 5.0 ... 4.056e+03 5e+03
+Data variables:
+    average_T1      (Time) datetime64[ns] 2kB dask.array<chunksize=(1,), meta=np.ndarray>
+    average_T2      (Time) datetime64[ns] 2kB dask.array<chunksize=(1,), meta=np.ndarray>
+    average_DT      (Time) timedelta64[ns] 2kB dask.array<chunksize=(1,), meta=np.ndarray>
+    Time_bounds     (Time, nv) timedelta64[ns] 5kB dask.array<chunksize=(1, 2), meta=np.ndarray>
+    temp            (Time, st_ocean, yt_ocean, xt_ocean) float32 335GB dask.array<chunksize=(1, 1, 300, 300), meta=np.ndarray>
+Attributes:
+    filename:           TMP/ocean_temp_2010_01_01.nc.0000
+```
+
+```
+
+```
+
+
+
 
 ## Why
 

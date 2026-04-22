@@ -113,11 +113,27 @@ def test_array_xsd_child_order(tmp_path):
 
 # --- rules -----------------------------------------------------------------
 
-def test_r4_missing_crs_raises(tmp_path):
+def test_r4_missing_crs_requires_flag(tmp_path):
+    """With require_crs=True the writer raises; default is warn-and-omit."""
     ds, paths = _stack_ds(tmp_path, n=2)
     with pytest.raises(VrtWriterError, match="CRS"):
         write_mdim_vrt(ds, [str(p) for p in paths], tmp_path / "no.vrt",
+                        composition="stack", concat_dim="time",
+                        require_crs=True)
+
+
+def test_r4_missing_crs_warns_by_default(tmp_path):
+    """Default behaviour: warn and emit VRT without <SRS>."""
+    import warnings
+    ds, paths = _stack_ds(tmp_path, n=2)
+    out = tmp_path / "soft.vrt"
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        write_mdim_vrt(ds, [str(p) for p in paths], out,
                         composition="stack", concat_dim="time")
+    assert any("CRS" in str(x.message) for x in w), [str(x.message) for x in w]
+    root = ET.parse(out).getroot()
+    assert root.find(".//SRS") is None, "expected no <SRS> when CRS undetected"
 
 
 def test_r5_nonmonotonic_concat_raises(tmp_path):
@@ -171,10 +187,45 @@ def test_stack_wrong_source_count_raises(tmp_path):
                         composition="stack", concat_dim="time", crs=WKT)
 
 
-def test_concat_size_missing_raises(tmp_path):
+def test_concat_sizes_kwarg(tmp_path):
+    """sizes= kwarg is the one-liner alternative to dict-form sources."""
     ds, paths = _concat_ds(tmp_path, per=3, n_sources=2)
-    with pytest.raises(VrtWriterError, match="missing 'size'"):
-        write_mdim_vrt(ds, [str(p) for p in paths], tmp_path / "m.vrt",
+    out = write_mdim_vrt(
+        ds, [str(p) for p in paths], tmp_path / "k.vrt",
+        composition="concat", concat_dim="time", crs=WKT,
+        sizes=[3, 3],
+    )
+    root = ET.parse(out).getroot()
+    arr = [a for a in root.find("Group").findall("Array") if a.find("Source") is not None][0]
+    offsets = [s.find("DestSlab").get("offset") for s in arr.findall("Source")]
+    assert offsets == ["0,0,0", "3,0,0"]
+
+
+def test_concat_auto_size_from_opening_sources(tmp_path):
+    """Concat without any size hint: writer opens each source to read
+    sizes[concat_dim]. Works because the sources are real files on disk."""
+    ds, paths = _concat_ds(tmp_path, per=3, n_sources=2)
+    out = write_mdim_vrt(
+        ds, [str(p) for p in paths], tmp_path / "auto.vrt",
+        composition="concat", concat_dim="time", crs=WKT,
+        # no sizes=, no dict form — should auto-discover
+    )
+    root = ET.parse(out).getroot()
+    arr = [a for a in root.find("Group").findall("Array") if a.find("Source") is not None][0]
+    offsets = [s.find("DestSlab").get("offset") for s in arr.findall("Source")]
+    assert offsets == ["0,0,0", "3,0,0"]
+
+
+def test_concat_unopenable_sources_error_message(tmp_path):
+    """When the source is unreachable and no sizes hint exists, the error
+    message suggests sizes= / dict-form rather than parroting the IO error."""
+    ds, paths = _concat_ds(tmp_path, per=3, n_sources=2)
+    # Point at nonexistent paths with no chunk info to reuse.
+    bad = [str(tmp_path / "nope_0.nc"), str(tmp_path / "nope_1.nc")]
+    # Drop dask chunking so step 3 is skipped and we fall straight to step 4.
+    ds_loaded = ds.load()
+    with pytest.raises(VrtWriterError, match="sizes="):
+        write_mdim_vrt(ds_loaded, bad, tmp_path / "u.vrt",
                         composition="concat", concat_dim="time", crs=WKT)
 
 

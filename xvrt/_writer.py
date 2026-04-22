@@ -31,9 +31,11 @@ def write_mdim_vrt(
     composition: Composition,
     concat_dim: str | None = None,
     crs: str | None = None,
+    sizes: Sequence[int] | None = None,
     block_size: Sequence[int] | Mapping[str, Sequence[int]] | None = None,
     coord_mode: CoordMode | Mapping[str, CoordMode] = "auto",
     inline_threshold: int = 10_000,
+    require_crs: bool = False,
 ) -> Path:
     """Emit a GDAL multidim VRT from an xarray Dataset.
 
@@ -43,7 +45,7 @@ def write_mdim_vrt(
         The Dataset whose shape / dims / coords / data-vars describe the
         desired virtual composition.
     sources
-        ``list[str | Path | dict]`` — see :class:`xvrt._sources.Source`.
+        ``list[str | Path | dict]``.
     path
         Output ``.vrt`` path.
     composition
@@ -52,17 +54,27 @@ def write_mdim_vrt(
     concat_dim
         Required for stack (new dim name) and concat (existing dim name).
     crs
-        WKT string. If not supplied, we look at
-        ``ds[dv].attrs["crs_wkt"]`` / ``ds[dv].rio.crs`` for each data var;
-        if neither is available the writer raises per R4.
+        WKT string. If omitted, we look at ``ds[dv].attrs["crs_wkt"]`` /
+        ``ds[dv].rio.crs`` / CF ``grid_mapping``; if still absent the
+        writer emits no ``<SRS>`` and warns. Pass ``require_crs=True`` for
+        strict R4 behaviour.
+    sizes
+        Convenience shortcut for concat: ``list[int]`` of per-source sizes
+        along ``concat_dim``. If not given, we try (in order):
+        per-source ``size`` in dict-form sources, ``ds.chunks[concat_dim]``
+        when the number of chunks matches the number of sources, then
+        opening each source to read ``.sizes[concat_dim]``.
     block_size
-        Either a sequence matching array dim order (applied to every data
-        var), or a dict keyed by data-var name. If ``None``, fall back to
-        ``ds[dv].chunks`` when present, else omit.
+        Sequence matching array dim order, or dict keyed by data-var name.
+        ``None`` falls back to ``ds[dv].chunks`` when present.
     coord_mode
         ``"auto"`` (default) | ``"inline"`` | ``"source"`` or dict per coord.
     inline_threshold
         In auto mode, coords with ``size <= threshold`` go inline.
+    require_crs
+        When True, raise :class:`VrtWriterError` if no CRS can be
+        determined. Default False (warn-and-omit); matches the reality of
+        ocean NetCDFs and other CRS-less sources.
     """
     if composition not in ("stack", "concat", "mosaic"):
         raise VrtWriterError(
@@ -101,11 +113,18 @@ def write_mdim_vrt(
         composition=composition,
     )
 
+    # Resolve per-source sizes for concat (auto-discover before checking).
+    if composition == "concat":
+        sources_norm = _resolve_concat_sizes(
+            ds=ds, data_var=data_var, concat_dim=concat_dim,
+            sources=sources_norm, explicit=sizes,
+        )
+
     # R7: array-name disjointness.
     _check_array_name_collisions(ds)
 
-    # R4: CRS must be explicit or detectable.
-    crs_wkt = _resolve_crs(ds, data_var, crs)
+    # R4: CRS — strict or soft.
+    crs_wkt = _resolve_crs(ds, data_var, crs, require=require_crs)
 
     # Composition-specific dim / size arithmetic.
     if composition == "stack":
@@ -191,7 +210,13 @@ def _check_array_name_collisions(ds: xr.Dataset) -> None:
         )
 
 
-def _resolve_crs(ds: xr.Dataset, data_var: str, crs_arg: str | None) -> str | None:
+def _resolve_crs(
+    ds: xr.Dataset,
+    data_var: str,
+    crs_arg: str | None,
+    *,
+    require: bool = False,
+) -> str | None:
     if crs_arg is not None:
         return crs_arg
 
@@ -218,10 +243,22 @@ def _resolve_crs(ds: xr.Dataset, data_var: str, crs_arg: str | None) -> str | No
     if gm and gm in ds.variables:
         return _resolve_crs_coord(ds[gm])
 
-    raise VrtWriterError(
-        "CRS not supplied and not detected on ds. Pass crs= explicitly (WKT) "
-        "or attach crs_wkt / grid_mapping per CF conventions (R4)."
+    if require:
+        raise VrtWriterError(
+            "CRS not supplied and not detected on ds. Pass crs= explicitly "
+            "(WKT) or attach crs_wkt / grid_mapping per CF conventions. "
+            "(require_crs=True mode.)"
+        )
+
+    import warnings
+    warnings.warn(
+        "CRS not supplied and not detected; emitting VRT without <SRS>. "
+        "Pass crs=<WKT> to attach one, or require_crs=True to make this an "
+        "error.",
+        UserWarning,
+        stacklevel=3,
     )
+    return None
 
 
 def _resolve_crs_coord(coord: xr.DataArray) -> str | None:
@@ -256,6 +293,92 @@ def _check_stack(
             f"composition='stack': {n_sources} sources provided but "
             f"ds.sizes[{new_dim!r}] = {n_along}. One source per element."
         )
+
+
+def _resolve_concat_sizes(
+    *,
+    ds: xr.Dataset,
+    data_var: str,
+    concat_dim: str,
+    sources: list[Source],
+    explicit: Sequence[int] | None,
+) -> list[Source]:
+    """Fill in ``Source.size`` along the concat dim by any means available.
+
+    Priority:
+      1. ``explicit`` — the ``sizes=`` kwarg, one int per source
+      2. ``Source.size`` already set (dict-form input)
+      3. ``ds[data_var].chunks[concat_axis]`` if #chunks == #sources
+         (common case for ``open_mfdataset`` default, one chunk per file)
+      4. open each source path and read ``.sizes[concat_dim]``
+
+    Returns a new list of Source records with ``size`` populated.
+    """
+    n = len(sources)
+
+    # 1. Explicit kwarg wins outright.
+    if explicit is not None:
+        if len(explicit) != n:
+            raise VrtWriterError(
+                f"sizes= has length {len(explicit)}, expected {n} "
+                "(one per source)."
+            )
+        return [
+            Source(s.path, s.array, s.relative_to_vrt, int(sz), s.extra)
+            for s, sz in zip(sources, explicit)
+        ]
+
+    # 2. Already present on every source? Nothing to do.
+    if all(s.size is not None for s in sources):
+        return list(sources)
+
+    resolved_sizes: list[int | None] = [s.size for s in sources]
+
+    # 3. Try ds chunks along the concat axis.
+    da = ds[data_var]
+    if concat_dim in da.dims:
+        axis = da.dims.index(concat_dim)
+        chunks = da.chunks  # tuple-of-tuples, or None
+        if chunks is not None:
+            per_axis = chunks[axis]
+            if len(per_axis) == n:
+                for i, cs in enumerate(per_axis):
+                    if resolved_sizes[i] is None:
+                        resolved_sizes[i] = int(cs)
+
+    # 4. Fallback: open each source without a size, read its concat dim.
+    if any(sz is None for sz in resolved_sizes):
+        # Lazy import — only pay the cost when we need to.
+        import xarray as _xr  # local alias clarifies this is a fallback path
+        for i, (src, sz) in enumerate(zip(sources, resolved_sizes)):
+            if sz is not None:
+                continue
+            # Use original user-supplied path for opening, not the
+            # possibly-rewritten one in src.path.
+            open_target = src.original or src.path
+            try:
+                with _xr.open_dataset(open_target, decode_times=False) as sds:
+                    if concat_dim not in sds.sizes:
+                        raise VrtWriterError(
+                            f"source #{i} ({open_target}): concat dim "
+                            f"{concat_dim!r} not found. Pass sizes= or "
+                            "dict-form sources with size= to override."
+                        )
+                    resolved_sizes[i] = int(sds.sizes[concat_dim])
+            except VrtWriterError:
+                raise
+            except Exception as e:
+                raise VrtWriterError(
+                    f"source #{i} ({open_target}): could not open to read "
+                    f"size along {concat_dim!r} "
+                    f"({type(e).__name__}: {e}). Pass sizes= or dict-form "
+                    "sources with size= to supply it directly."
+                ) from e
+
+    return [
+        Source(s.path, s.array, s.relative_to_vrt, int(sz), s.extra, s.original)
+        for s, sz in zip(sources, resolved_sizes)
+    ]
 
 
 def _check_concat(
