@@ -247,14 +247,21 @@ def test_mosaic_not_implemented(tmp_path):
                         composition="mosaic", crs=WKT)
 
 
-def test_datetime_coord_raises_with_hint(tmp_path):
-    """When time comes out as datetime64 (default decode), refuse clearly."""
+def test_datetime_coord_auto_encoded(tmp_path):
+    """datetime64 time coord is auto-encoded using xarray's stashed
+    encoding['units'] — user does not need decode_times=False."""
     paths = [_make_nc(tmp_path, i, nt=1) for i in range(2)]
-    pieces = [xr.open_dataset(p) for p in paths]  # default: decode_times=True
+    pieces = [xr.open_dataset(p) for p in paths]  # default decodes time
     ds = xr.concat(pieces, dim="time")
-    with pytest.raises(VrtWriterError, match="encode_datetime_coord"):
-        write_mdim_vrt(ds, [str(p) for p in paths], tmp_path / "dt.vrt",
-                        composition="stack", concat_dim="time", crs=WKT)
+    assert ds["time"].dtype.kind == "M"  # precondition: time is datetime64
+    out = write_mdim_vrt(ds, [str(p) for p in paths], tmp_path / "dt.vrt",
+                          composition="stack", concat_dim="time", crs=WKT)
+    root = ET.parse(out).getroot()
+    # Time coord Array should have Float64 DataType and a <Unit>.
+    time_arr = next(a for a in root.iter("Array") if a.get("name") == "time")
+    assert time_arr.find("DataType").text == "Float64"
+    unit = time_arr.find("Unit")
+    assert unit is not None and "since" in unit.text
 
 
 # --- accessor --------------------------------------------------------------

@@ -356,29 +356,51 @@ def _resolve_concat_sizes(
             # Use original user-supplied path for opening, not the
             # possibly-rewritten one in src.path.
             open_target = src.original or src.path
-            try:
-                with _xr.open_dataset(open_target, decode_times=False) as sds:
-                    if concat_dim not in sds.sizes:
-                        raise VrtWriterError(
-                            f"source #{i} ({open_target}): concat dim "
-                            f"{concat_dim!r} not found. Pass sizes= or "
-                            "dict-form sources with size= to override."
-                        )
-                    resolved_sizes[i] = int(sds.sizes[concat_dim])
-            except VrtWriterError:
-                raise
-            except Exception as e:
-                raise VrtWriterError(
-                    f"source #{i} ({open_target}): could not open to read "
-                    f"size along {concat_dim!r} "
-                    f"({type(e).__name__}: {e}). Pass sizes= or dict-form "
-                    "sources with size= to supply it directly."
-                ) from e
+            resolved_sizes[i] = _open_and_read_size(open_target, concat_dim, i)
 
     return [
         Source(s.path, s.array, s.relative_to_vrt, int(sz), s.extra, s.original)
         for s, sz in zip(sources, resolved_sizes)
     ]
+
+
+def _open_and_read_size(target: str, concat_dim: str, index: int) -> int:
+    """Open a source with whichever engine can read it, return concat size.
+
+    URLs (http/https) need ``h5netcdf`` (fsspec-capable); the default
+    ``netCDF4`` engine chokes on them. Local files work with either.
+    Tries a small ordered list of engines before giving up.
+    """
+    import xarray as _xr
+
+    is_url = target.startswith("http://") or target.startswith("https://")
+    engines: list[str | None] = ["h5netcdf", None] if is_url else [None, "h5netcdf"]
+
+    errors: list[str] = []
+    for engine in engines:
+        try:
+            open_kw = {"decode_times": False}
+            if engine is not None:
+                open_kw["engine"] = engine
+            with _xr.open_dataset(target, **open_kw) as sds:
+                if concat_dim not in sds.sizes:
+                    raise VrtWriterError(
+                        f"source #{index} ({target}): concat dim "
+                        f"{concat_dim!r} not found. Pass sizes= or dict-form "
+                        "sources with size= to override."
+                    )
+                return int(sds.sizes[concat_dim])
+        except VrtWriterError:
+            raise
+        except Exception as e:  # keep trying other engines
+            errors.append(f"{engine or 'default'}: {type(e).__name__}: {e}")
+
+    raise VrtWriterError(
+        f"source #{index} ({target}): could not open to read size along "
+        f"{concat_dim!r}. Tried engines: " + " | ".join(errors) +
+        ". Pass sizes= (list[int]) or dict-form sources with size= to "
+        "supply it directly."
+    )
 
 
 def _check_concat(
@@ -556,6 +578,52 @@ def _format_attr_value(v: Any) -> str:
     return str(v)
 
 
+def _reencode_datetime_coord(da: xr.DataArray) -> xr.DataArray:
+    """Convert a datetime64 coord back to numeric with a CF ``units`` attr.
+
+    xarray stashes the original CF ``units`` string in ``da.encoding``
+    when it decodes on open (e.g. ``"seconds since 1978-01-01"``). We use
+    that to round-trip faithfully so reading the VRT reproduces the same
+    timestamps. If ``encoding["units"]`` is absent we default to
+    ``"days since 1970-01-01"`` — a benign choice since the numeric values
+    still represent the same moments in time.
+    """
+    import re as _re
+
+    units = da.encoding.get("units") or da.attrs.get("units")
+    if not isinstance(units, str) or "since" not in units:
+        units = "days since 1970-01-01"
+
+    # Parse "<unit> since <origin>".
+    m = _re.match(r"^\s*(\w+)\s+since\s+(.+?)\s*$", units)
+    if not m:
+        units = "days since 1970-01-01"
+        m = _re.match(r"^\s*(\w+)\s+since\s+(.+?)\s*$", units)
+
+    unit_word, origin_str = m.group(1).lower(), m.group(2)
+    unit_map = {
+        "second": "s", "seconds": "s", "sec": "s", "secs": "s", "s": "s",
+        "minute": "m", "minutes": "m", "min": "m", "mins": "m",
+        "hour": "h", "hours": "h", "hr": "h", "hrs": "h",
+        "day": "D", "days": "D", "d": "D",
+    }
+    if unit_word not in unit_map:
+        # Unknown unit — fall back to days.
+        unit_word = "days"
+        origin_str = "1970-01-01"
+        units = f"days since {origin_str}"
+
+    origin = np.datetime64(origin_str.split(" ")[0])  # drop any hh:mm:ss
+    div = np.timedelta64(1, unit_map[unit_word])
+    numeric = (da.values - origin) / div
+
+    # Preserve existing attrs but overwrite units to match the encoding we
+    # actually chose (in case we fell back to "days since 1970-01-01").
+    attrs = {**da.attrs, "units": units}
+    return xr.DataArray(numeric.astype(np.float64), dims=da.dims,
+                         coords=da.coords, attrs=attrs, name=da.name)
+
+
 def _emit_coord_array(
     parent: ET.Element,
     da: xr.DataArray,
@@ -565,6 +633,13 @@ def _emit_coord_array(
     threshold: int,
     sources: list[Source],
 ) -> None:
+    # Auto-encode datetime64 coords to numeric + CF units. xarray stashes
+    # the original "units" string in encoding when it decodes times on open;
+    # we round-trip back through it where possible so the VRT reads back to
+    # the same timestamps. Fallback origin is the unix epoch.
+    if da.dtype.kind == "M":
+        da = _reencode_datetime_coord(da)
+
     arr = X.sub(parent, "Array", name=dim)
     vrt_dtype = numpy_to_vrt_dtype(da.dtype)
     X.sub(arr, "DataType", text=vrt_dtype)
