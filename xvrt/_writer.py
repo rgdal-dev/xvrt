@@ -1,0 +1,648 @@
+"""Main writer.
+
+Public surface: :func:`write_mdim_vrt` and :func:`encode_datetime_coord`.
+"""
+from __future__ import annotations
+
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Any, Literal, Mapping, Sequence
+
+import numpy as np
+import xarray as xr
+
+from . import _xml as X
+from ._coords import CoordMode, detect_regular, resolve_mode
+from ._dtype import numpy_to_vrt_dtype
+from ._errors import VrtWriterError
+from ._sources import Source, normalise_sources
+
+
+Composition = Literal["stack", "concat", "mosaic"]
+
+
+# -- public API -------------------------------------------------------------
+
+def write_mdim_vrt(
+    ds: xr.Dataset,
+    sources: Sequence[Any],
+    path: str | Path,
+    *,
+    composition: Composition,
+    concat_dim: str | None = None,
+    crs: str | None = None,
+    block_size: Sequence[int] | Mapping[str, Sequence[int]] | None = None,
+    coord_mode: CoordMode | Mapping[str, CoordMode] = "auto",
+    inline_threshold: int = 10_000,
+) -> Path:
+    """Emit a GDAL multidim VRT from an xarray Dataset.
+
+    Parameters
+    ----------
+    ds
+        The Dataset whose shape / dims / coords / data-vars describe the
+        desired virtual composition.
+    sources
+        ``list[str | Path | dict]`` — see :class:`xvrt._sources.Source`.
+    path
+        Output ``.vrt`` path.
+    composition
+        ``"stack"`` | ``"concat"`` | ``"mosaic"``. **v0 implements stack
+        and concat**; mosaic raises ``NotImplementedError``.
+    concat_dim
+        Required for stack (new dim name) and concat (existing dim name).
+    crs
+        WKT string. If not supplied, we look at
+        ``ds[dv].attrs["crs_wkt"]`` / ``ds[dv].rio.crs`` for each data var;
+        if neither is available the writer raises per R4.
+    block_size
+        Either a sequence matching array dim order (applied to every data
+        var), or a dict keyed by data-var name. If ``None``, fall back to
+        ``ds[dv].chunks`` when present, else omit.
+    coord_mode
+        ``"auto"`` (default) | ``"inline"`` | ``"source"`` or dict per coord.
+    inline_threshold
+        In auto mode, coords with ``size <= threshold`` go inline.
+    """
+    if composition not in ("stack", "concat", "mosaic"):
+        raise VrtWriterError(
+            f"composition: expected 'stack'|'concat'|'mosaic', got {composition!r}"
+        )
+    if composition == "mosaic":
+        raise NotImplementedError(
+            "mosaic composition is v1 scope — not implemented yet."
+        )
+    if composition in ("stack", "concat") and concat_dim is None:
+        raise VrtWriterError(
+            f"composition={composition!r} requires concat_dim="
+        )
+
+    path = Path(path)
+
+    # Normalise sources. For stack, the new dim is concat_dim and each source
+    # contributes one element; for concat it exists already on ds.
+    data_vars = list(ds.data_vars)
+    if len(data_vars) == 0:
+        raise VrtWriterError("ds has no data_vars")
+    if len(data_vars) > 1:
+        # v0 keeps it simple — one data_var per call. Multi-var would need
+        # per-var source dispatch; punt to v0.5.
+        raise NotImplementedError(
+            f"ds has multiple data_vars ({data_vars}); v0 supports a single "
+            "data_var per write call. Split the Dataset with ds[[var]] and "
+            "write once per variable."
+        )
+    (data_var,) = data_vars
+
+    sources_norm = normalise_sources(
+        sources,
+        default_array=data_var,
+        vrt_path=path,
+        composition=composition,
+    )
+
+    # R7: array-name disjointness.
+    _check_array_name_collisions(ds)
+
+    # R4: CRS must be explicit or detectable.
+    crs_wkt = _resolve_crs(ds, data_var, crs)
+
+    # Composition-specific dim / size arithmetic.
+    if composition == "stack":
+        _check_stack(ds, data_var, sources_norm, concat_dim)
+    elif composition == "concat":
+        _check_concat(ds, data_var, sources_norm, concat_dim)
+
+    # Build XML.
+    root = _build_vrt(
+        ds=ds,
+        data_var=data_var,
+        sources=sources_norm,
+        composition=composition,
+        concat_dim=concat_dim,
+        crs_wkt=crs_wkt,
+        block_size=block_size,
+        coord_mode=coord_mode,
+        inline_threshold=inline_threshold,
+    )
+
+    xml_bytes = X.tostring(root)
+    path.write_bytes(xml_bytes)
+    return path
+
+
+def encode_datetime_coord(
+    da: xr.DataArray,
+    *,
+    unit: Literal["seconds", "minutes", "hours", "days"] = "days",
+    since: str = "1970-01-01",
+) -> xr.DataArray:
+    """Convert a datetime64 coord DataArray to numeric + CF ``units`` attr.
+
+    Handy pre-step when you have a ``datetime64[ns]`` time coord and want to
+    feed it to the writer (which refuses datetime dtypes per v0 policy).
+    """
+    if da.dtype.kind != "M":
+        raise VrtWriterError(f"encode_datetime_coord: {da.name} is not datetime64")
+    origin = np.datetime64(since)
+    delta = (da.values - origin)
+    div = {"seconds": np.timedelta64(1, "s"),
+           "minutes": np.timedelta64(1, "m"),
+           "hours":   np.timedelta64(1, "h"),
+           "days":    np.timedelta64(1, "D")}[unit]
+    numeric = delta / div
+    out = xr.DataArray(numeric.astype(np.float64), dims=da.dims, coords=da.coords,
+                       attrs={**da.attrs, "units": f"{unit} since {since}"},
+                       name=da.name)
+    return out
+
+
+# -- internals --------------------------------------------------------------
+
+def _check_array_name_collisions(ds: xr.Dataset) -> None:
+    """R7: the VRT ``<Group>`` has a flat namespace across Dimension and
+    Array elements. xarray allows a dim name to coincide with a data-var
+    name (e.g. ``xr.DataArray(..., dims=("foo",), name="foo")``); this is
+    legal in xarray but emits two children with the same name in the VRT.
+
+    Dim-coords (where ``dim_name == coord_name``) are the normal case and
+    are NOT a collision — they're exactly how indexing variables are
+    expressed in the XSD. We only flag real duplicates.
+    """
+    dims = set(ds.dims)
+    coords = set(ds.coords)
+    data_vars = set(ds.data_vars)
+
+    # Non-dim coord names must not collide with data-var names.
+    non_dim_coords = coords - dims
+    cc = non_dim_coords & data_vars
+    if cc:
+        raise VrtWriterError(
+            f"array-name collision (R7): {sorted(cc)} appear as both coord "
+            "and data_var. VRT requires a flat namespace."
+        )
+    # Dim names must not collide with data-var names (unless it's a dim-coord).
+    dc = (dims & data_vars) - coords
+    if dc:
+        raise VrtWriterError(
+            f"array-name collision (R7): {sorted(dc)} appear as both dim "
+            "and data_var without being a dim-coord. VRT requires a flat "
+            "namespace."
+        )
+
+
+def _resolve_crs(ds: xr.Dataset, data_var: str, crs_arg: str | None) -> str | None:
+    if crs_arg is not None:
+        return crs_arg
+
+    # Look on the data_var.
+    da = ds[data_var]
+    for key in ("crs_wkt", "spatial_ref", "esri_pe_string"):
+        v = da.attrs.get(key)
+        if isinstance(v, str) and v.strip():
+            return v
+
+    # Try rio accessor if available — non-mandatory dep.
+    try:
+        import rioxarray  # noqa: F401
+        maybe = da.rio.crs
+        if maybe is not None:
+            return maybe.to_wkt()
+    except Exception:
+        pass
+
+    # Look at any coord that looks like a grid_mapping pointer (CF convention).
+    gm = da.attrs.get("grid_mapping")
+    if gm and gm in ds.coords:
+        return _resolve_crs_coord(ds[gm])
+    if gm and gm in ds.variables:
+        return _resolve_crs_coord(ds[gm])
+
+    raise VrtWriterError(
+        "CRS not supplied and not detected on ds. Pass crs= explicitly (WKT) "
+        "or attach crs_wkt / grid_mapping per CF conventions (R4)."
+    )
+
+
+def _resolve_crs_coord(coord: xr.DataArray) -> str | None:
+    for key in ("crs_wkt", "spatial_ref"):
+        v = coord.attrs.get(key)
+        if isinstance(v, str) and v.strip():
+            return v
+    return None
+
+
+def _check_stack(
+    ds: xr.Dataset,
+    data_var: str,
+    sources: list[Source],
+    new_dim: str,
+) -> None:
+    da = ds[data_var]
+    if new_dim not in da.dims:
+        raise VrtWriterError(
+            f"composition='stack': new dim {new_dim!r} must be present in "
+            f"ds[{data_var!r}].dims — it isn't. dims are {da.dims}."
+        )
+    if new_dim not in ds.coords:
+        raise VrtWriterError(
+            f"composition='stack': coord for new dim {new_dim!r} is required. "
+            "Assign it via ds = ds.assign_coords({...})."
+        )
+    n_sources = len(sources)
+    n_along = ds.sizes[new_dim]
+    if n_sources != n_along:
+        raise VrtWriterError(
+            f"composition='stack': {n_sources} sources provided but "
+            f"ds.sizes[{new_dim!r}] = {n_along}. One source per element."
+        )
+
+
+def _check_concat(
+    ds: xr.Dataset,
+    data_var: str,
+    sources: list[Source],
+    dim: str,
+) -> None:
+    da = ds[data_var]
+    if dim not in da.dims:
+        raise VrtWriterError(
+            f"composition='concat': concat_dim {dim!r} must be a dim of "
+            f"ds[{data_var!r}]. dims are {da.dims}."
+        )
+    # Each source must declare its size along the concat dim.
+    missing = [i for i, s in enumerate(sources) if s.size is None]
+    if missing:
+        raise VrtWriterError(
+            f"composition='concat': sources {missing} missing 'size'. Pass "
+            "sources as list[dict] with {'path': ..., 'size': N} for each."
+        )
+    total = sum(s.size for s in sources)
+    n_along = ds.sizes[dim]
+    if total != n_along:
+        raise VrtWriterError(
+            f"composition='concat': source sizes along {dim!r} sum to "
+            f"{total}, but ds.sizes[{dim!r}] = {n_along}."
+        )
+    # R5: monotonicity of concat-dim coord.
+    if dim in ds.coords:
+        vals = np.asarray(ds[dim].values)
+        if vals.dtype.kind in "fiu":
+            diffs = np.diff(vals.astype(np.float64))
+            if not (np.all(diffs > 0) or np.all(diffs < 0)):
+                raise VrtWriterError(
+                    f"composition='concat': coord {dim!r} is not strictly "
+                    "monotonic across concatenated sources (R5)."
+                )
+
+
+# -- build the element tree -------------------------------------------------
+
+def _build_vrt(
+    *,
+    ds: xr.Dataset,
+    data_var: str,
+    sources: list[Source],
+    composition: Composition,
+    concat_dim: str | None,
+    crs_wkt: str | None,
+    block_size: Sequence[int] | Mapping[str, Sequence[int]] | None,
+    coord_mode: CoordMode | Mapping[str, CoordMode],
+    inline_threshold: int,
+) -> ET.Element:
+    da = ds[data_var]
+    dims = list(da.dims)
+
+    root = ET.Element("VRTDataset")
+    grp = X.sub(root, "Group", name="/")
+
+    # <Dimension> elements — in the order the data-var dims appear.
+    for d in dims:
+        size = ds.sizes[d]
+        attrs: dict[str, Any] = {"name": d, "size": size}
+        if d in ds.coords:
+            attrs["indexingVariable"] = d
+        dim_type, dim_dir = _axis_role(ds, d)
+        if dim_type is not None:
+            attrs["type"] = dim_type
+        if dim_dir is not None:
+            attrs["direction"] = dim_dir
+        X.sub(grp, "Dimension", **attrs)
+
+    # Dataset-level <Attribute>s (ds.attrs).
+    _emit_attrs(grp, ds.attrs)
+
+    # Coord <Array>s — one per 1D coord that matches a dim.
+    for d in dims:
+        if d not in ds.coords:
+            continue
+        _emit_coord_array(
+            grp, ds.coords[d], dim=d,
+            mode=coord_mode, threshold=inline_threshold, sources=sources,
+        )
+
+    # Data-var <Array>.
+    _emit_data_array(
+        grp,
+        da=da,
+        name=data_var,
+        sources=sources,
+        composition=composition,
+        concat_dim=concat_dim,
+        crs_wkt=crs_wkt,
+        block_size=_resolve_block_size(da, block_size, data_var),
+    )
+
+    return root
+
+
+def _axis_role(ds: xr.Dataset, dim: str) -> tuple[str | None, str | None]:
+    """Return (type, direction) for <Dimension> when detectable from CF attrs.
+
+    Conservative: only emit type/direction when we can justify it. Users can
+    override by hand-editing or by attaching CF ``axis``/``standard_name``
+    attrs to the coord.
+    """
+    if dim not in ds.coords:
+        return (None, None)
+    attrs = ds.coords[dim].attrs
+    axis = attrs.get("axis", "").upper()
+    stdname = attrs.get("standard_name", "").lower()
+    if axis == "T" or "time" in stdname:
+        return ("TEMPORAL", None)
+    if axis == "Z" or stdname in {"depth", "altitude", "height"}:
+        direction = None
+        if stdname == "depth":
+            direction = "DOWN"
+        elif stdname in {"altitude", "height"}:
+            direction = "UP"
+        return ("VERTICAL", direction)
+    if axis == "X" or stdname in {"longitude", "projection_x_coordinate"}:
+        return ("HORIZONTAL_X", "EAST")
+    if axis == "Y" or stdname in {"latitude", "projection_y_coordinate"}:
+        return ("HORIZONTAL_Y", "NORTH")
+    return (None, None)
+
+
+def _emit_attrs(parent: ET.Element, attrs: Mapping[str, Any]) -> None:
+    """Emit xarray attrs as <Attribute> children.
+
+    Per the plan's Open Questions: warn and filter on unsupported types
+    rather than raise. Here we silently drop attrs whose values aren't
+    representable — a future revision should surface a warning list.
+    """
+    for name, val in attrs.items():
+        dt, items = _attr_dtype_and_values(val)
+        if dt is None:
+            continue  # TODO: accumulate filtered names and emit one warning.
+        a = X.sub(parent, "Attribute", name=name)
+        X.sub(a, "DataType", text=dt)
+        for v in items:
+            X.sub(a, "Value", text=_format_attr_value(v))
+
+
+def _attr_dtype_and_values(val: Any) -> tuple[str | None, list[Any]]:
+    if isinstance(val, str):
+        return ("String", [val])
+    if isinstance(val, (bool, np.bool_)):
+        return ("Int32", [int(val)])
+    if isinstance(val, (int, np.integer)):
+        return ("Int64", [int(val)])
+    if isinstance(val, (float, np.floating)):
+        return ("Float64", [float(val)])
+    if isinstance(val, np.ndarray):
+        if val.dtype.kind in "iu":
+            return ("Int64", val.tolist())
+        if val.dtype.kind == "f":
+            return ("Float64", val.tolist())
+        if val.dtype.kind in ("U", "S"):
+            return ("String", [str(v) for v in val.tolist()])
+    if isinstance(val, (list, tuple)) and val:
+        # Delegate by element type of first item.
+        try:
+            arr = np.asarray(val)
+            return _attr_dtype_and_values(arr)
+        except Exception:
+            return (None, [])
+    return (None, [])
+
+
+def _format_attr_value(v: Any) -> str:
+    if isinstance(v, float):
+        return X.repr_double(v)
+    return str(v)
+
+
+def _emit_coord_array(
+    parent: ET.Element,
+    da: xr.DataArray,
+    *,
+    dim: str,
+    mode: CoordMode | Mapping[str, CoordMode],
+    threshold: int,
+    sources: list[Source],
+) -> None:
+    arr = X.sub(parent, "Array", name=dim)
+    vrt_dtype = numpy_to_vrt_dtype(da.dtype)
+    X.sub(arr, "DataType", text=vrt_dtype)
+    X.sub(arr, "DimensionRef", ref=dim)
+
+    # <Unit> from CF units attr. Emitted before value carrier per XSD.
+    units = da.attrs.get("units")
+    if isinstance(units, str) and units.strip():
+        X.sub(arr, "Unit", text=units)
+
+    # Regular-spacing detection comes first, independent of coord_mode.
+    values = np.asarray(da.values)
+    reg = detect_regular(values) if values.dtype.kind in "fiu" else None
+    if reg is not None:
+        start, inc = reg
+        X.sub(arr, "RegularlySpacedValues",
+              start=X.repr_double(start),
+              increment=X.repr_double(inc))
+        _emit_attrs(arr, _filter_axis_attrs(da.attrs))
+        return
+
+    chosen = resolve_mode(dim, values, mode, threshold=threshold)
+    if chosen == "inline":
+        ivv = X.sub(arr, "InlineValuesWithValueElement")
+        if values.dtype.kind == "f":
+            for v in values.tolist():
+                X.sub(ivv, "Value", text=X.repr_double(v))
+        else:
+            for v in values.tolist():
+                X.sub(ivv, "Value", text=str(v))
+    elif chosen == "source":
+        # Point at the first source — caller is promising the coord is there
+        # and identical across sources (R3 ensures consistency for spatial
+        # dims in stack/concat; for the concat dim we inline always).
+        src = sources[0]
+        s = X.sub(arr, "Source")
+        X.sub(s, "SourceFilename", text=src.path,
+              relativeToVRT=src.relative_to_vrt)
+        X.sub(s, "SourceArray", text=_full_array_name(dim))
+    else:
+        raise AssertionError(f"unreachable coord mode: {chosen}")
+
+    _emit_attrs(arr, _filter_axis_attrs(da.attrs))
+
+
+def _filter_axis_attrs(attrs: Mapping[str, Any]) -> dict[str, Any]:
+    """Strip attrs that are already represented as XML attributes / elements."""
+    return {k: v for k, v in attrs.items()
+            if k not in {"units", "axis", "standard_name",
+                         "_FillValue", "missing_value"}}
+
+
+def _full_array_name(name: str) -> str:
+    """Return the full-name form GDAL uses inside <SourceArray>: leading slash."""
+    return name if name.startswith("/") else f"/{name}"
+
+
+def _emit_data_array(
+    parent: ET.Element,
+    *,
+    da: xr.DataArray,
+    name: str,
+    sources: list[Source],
+    composition: Composition,
+    concat_dim: str | None,
+    crs_wkt: str | None,
+    block_size: list[int] | None,
+) -> None:
+    arr = X.sub(parent, "Array", name=name)
+    X.sub(arr, "DataType", text=numpy_to_vrt_dtype(da.dtype))
+    for d in da.dims:
+        X.sub(arr, "DimensionRef", ref=d)
+
+    if block_size is not None:
+        X.sub(arr, "BlockSize", text=X.int_list(block_size))
+
+    if crs_wkt:
+        # Spatial axis mapping: GDAL convention is "2,1" when
+        # (y, x) dim order puts y before x. Detect and emit.
+        mapping = _axis_mapping(da)
+        X.sub(arr, "SRS", text=crs_wkt, dataAxisToSRSAxisMapping=mapping)
+
+    # <Unit> / <NoDataValue> / <Offset> / <Scale> from attrs.
+    units = da.attrs.get("units")
+    if isinstance(units, str) and units.strip():
+        X.sub(arr, "Unit", text=units)
+    fill = da.attrs.get("_FillValue", da.attrs.get("missing_value"))
+    if fill is not None:
+        try:
+            fv = float(fill)
+            if np.isfinite(fv):
+                X.sub(arr, "NoDataValue", text=X.repr_double(fv))
+            else:
+                # nan/inf — XSD allows the literal "nan"/"NAN".
+                X.sub(arr, "NoDataValue", text="nan" if np.isnan(fv) else str(fv))
+        except (TypeError, ValueError):
+            pass  # non-numeric fill — skip rather than emit garbage
+    off = da.attrs.get("add_offset")
+    if off is not None:
+        X.sub(arr, "Offset", text=X.repr_double(float(off)))
+    scl = da.attrs.get("scale_factor")
+    if scl is not None:
+        X.sub(arr, "Scale", text=X.repr_double(float(scl)))
+
+    # <Source> composition.
+    _emit_sources(
+        arr, sources=sources, da=da,
+        composition=composition, concat_dim=concat_dim,
+    )
+
+    # Remaining user attrs (strip those already materialised).
+    _emit_attrs(arr, _filter_axis_attrs(da.attrs))
+
+
+def _axis_mapping(da: xr.DataArray) -> str | None:
+    """Return the dataAxisToSRSAxisMapping string, or None if unclear.
+
+    The mapping is 1-based: element i (0-based array position) maps to the
+    given 1-based SRS axis. For typical (..., y, x) order with a geographic
+    SRS (lat, lon), the mapping is "...,2,1"; for projected (easting,
+    northing), it's "...,1,2".
+
+    We only emit when we can identify y/x (or lat/lon) positions. Otherwise
+    return None and let the reader use the default.
+    """
+    dims = list(da.dims)
+    # Look up on the array's coord attrs — a dim is "Y" if its coord has
+    # axis='Y' or similar.
+    axis_tags: list[str | None] = []
+    for d in dims:
+        tag = None
+        coord = da.coords.get(d)
+        if coord is not None:
+            a = coord.attrs.get("axis", "").upper()
+            sn = coord.attrs.get("standard_name", "").lower()
+            if a == "Y" or sn in {"latitude", "projection_y_coordinate"}:
+                tag = "Y"
+            elif a == "X" or sn in {"longitude", "projection_x_coordinate"}:
+                tag = "X"
+            elif a == "T" or "time" in sn:
+                tag = "T"
+            elif a == "Z":
+                tag = "Z"
+        axis_tags.append(tag)
+
+    if "Y" not in axis_tags or "X" not in axis_tags:
+        return None
+
+    # Geographic default: y → SRS axis 2 (lat), x → SRS axis 1 (lon).
+    # (The user can override post-hoc; v0 picks the common case.)
+    mapping = []
+    for t in axis_tags:
+        if t == "Y":
+            mapping.append("2")
+        elif t == "X":
+            mapping.append("1")
+        else:
+            # Non-spatial axes don't participate in the SRS mapping.
+            # GDAL accepts a short mapping that covers only spatial dims.
+            continue
+    return ",".join(mapping) if mapping else None
+
+
+def _resolve_block_size(
+    da: xr.DataArray,
+    block_size: Sequence[int] | Mapping[str, Sequence[int]] | None,
+    data_var: str,
+) -> list[int] | None:
+    if block_size is None:
+        if da.chunks is None:
+            return None
+        # ds.chunks is a tuple-of-tuples per dim; use the first chunk of each.
+        return [int(cs[0]) for cs in da.chunks]
+    if isinstance(block_size, Mapping):
+        bs = block_size.get(data_var)
+        if bs is None:
+            return None
+        return list(map(int, bs))
+    return list(map(int, block_size))
+
+
+def _emit_sources(
+    arr: ET.Element,
+    *,
+    sources: list[Source],
+    da: xr.DataArray,
+    composition: Composition,
+    concat_dim: str | None,
+) -> None:
+    dims = list(da.dims)
+    # Which axis participates in the composition.
+    comp_axis = dims.index(concat_dim) if concat_dim else 0
+    offset_so_far = 0
+    for s in sources:
+        size_along = 1 if composition == "stack" else int(s.size)  # type: ignore[arg-type]
+        src_el = X.sub(arr, "Source")
+        X.sub(src_el, "SourceFilename", text=s.path,
+              relativeToVRT=s.relative_to_vrt)
+        X.sub(src_el, "SourceArray", text=_full_array_name(s.array))
+        # DestSlab always emitted (plan rule — zeros included).
+        offsets = [0] * len(dims)
+        offsets[comp_axis] = offset_so_far
+        X.sub(src_el, "DestSlab", offset=X.comma_list(offsets))
+        offset_so_far += size_along
